@@ -1,0 +1,16 @@
+{
+  "name": "Legrand Expert AI",
+  "short_name": "LegrandAI",
+  "description": "Diagnostic Expert Legrand par IA",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#E2231A",
+  "icons": [
+    {
+      "src": "https://www.legrand.fr/modules/custom/legrand_core/logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
