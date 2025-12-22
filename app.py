@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from dotenv import load_dotenv
 
-# Imports des agents (doivent être à la racine du projet sur GitHub)
+# Imports des agents - Fichiers situés à la racine sur GitHub
 import database_standards as db
 from agent_expert_matiere import agent_expert_matiere
 from agent_standardiste import agent_standardiste
@@ -17,7 +17,7 @@ load_dotenv()
 
 app = FastAPI()
 
-# Configuration CORS pour autoriser les requêtes mobiles
+# Configuration pour autoriser les accès mobiles et PWA
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,10 +26,10 @@ app.add_middleware(
 )
 
 async def search_perplexity(query: str):
-    """Fonction de recherche web pour l'agent Sourcer."""
+    """Recherche web temps réel via Perplexity."""
     api_key = os.environ.get("PERPLEXITY_API_KEY")
     if not api_key:
-        return "Clé Perplexity manquante. Recherche marchande indisponible."
+        return "Recherche indisponible (Clé manquante)."
     
     url = "https://api.perplexity.ai/chat/completions"
     headers = {
@@ -46,31 +46,30 @@ async def search_perplexity(query: str):
             res = await client.post(url, json=data, headers=headers, timeout=25.0)
             return res.json()['choices'][0]['message']['content']
         except Exception:
-            return "Erreur lors de la recherche des revendeurs."
+            return "Impossible de récupérer les liens marchands."
 
 @app.post("/identify", response_class=HTMLResponse)
 async def identify(image: UploadFile = File(...), context: str = Form("")):
-    """Endpoint principal de diagnostic visuel."""
+    """Diagnostic visuel utilisant Llama 4 Scout."""
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        return "<p style='color:red;'>Erreur : Clé GROQ_API_KEY manquante dans les variables d'environnement.</p>"
+        return "<p style='color:red;'>Erreur : Variable GROQ_API_KEY absente sur Render.</p>"
 
     client = Groq(api_key=api_key)
     
     try:
-        # Lecture et encodage de l'image
+        # Encodage de l'image pour l'IA
         img_bytes = await image.read()
         img_b64 = base64.b64encode(img_bytes).decode('utf-8')
         
-        # 1. Analyse Vision via Groq (Modèle corrigé pour éviter l'erreur 400)
-        # On utilise le modèle vision le plus stable disponible
+        # 1. Analyse Vision via Groq avec le modèle Llama 4 Scout
         completion = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview", 
+            model="meta-llama/llama-4-scout-17b-16e-instruct", 
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"Identifie cette pièce de quincaillerie ou plomberie. Contexte : {context}. Analyse les dimensions et le matériau."},
+                        {"type": "text", "text": f"Analyse cette pièce détachée. Contexte : {context}"},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
                     ]
                 }
@@ -78,144 +77,105 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         )
         vision_analysis = completion.choices[0].message.content
 
-        # 2. Appel des agents spécialisés (logique métier)
-        matiere_info = agent_expert_matiere(vision_analysis)
-        standard_info = agent_standardiste(vision_analysis)
+        # 2. Traitement par les agents métier
+        matiere = agent_expert_matiere(vision_analysis)
+        standard = agent_standardiste(vision_analysis)
         
-        # 3. Sourcing web via Perplexity
-        sourcing_query = await agent_sourcer(vision_analysis)
-        liens_achat = await search_perplexity(sourcing_query)
+        # 3. Recherche de disponibilité
+        query_web = await agent_sourcer(vision_analysis)
+        liens = await search_perplexity(query_web)
 
-        # 4. Construction du rendu HTML propre pour l'application
-        # Utilisation de entités HTML pour éviter les conflits avec le symbole $ de Perplexity
-        liens_clean = liens_achat.replace('$', '&#36;')
-
+        # 4. Rendu HTML formaté pour l'application
         return f"""
-        <div class="result-container">
-            <div class="section-card" style="border-left: 5px solid #ea580c; background: #fff7ed; padding: 15px; margin-bottom: 15px; border-radius: 8px;">
-                <h3 style="color: #ea580c; margin-top: 0;">🔧 Analyse de la Pièce</h3>
-                <p><strong>Expertise Matériau :</strong> {matiere_info}</p>
-                <p><strong>Standards détectés :</strong> {standard_info}</p>
+        <div style="background:white; border-radius:10px;">
+            <div style="border-left:5px solid #ea580c; background:#fff7ed; padding:15px; margin-bottom:15px; border-radius:8px;">
+                <h3 style="color:#ea580c; margin-top:0;">🔧 Identification</h3>
+                <p><strong>Matière :</strong> {matiere}</p>
+                <p><strong>Standard :</strong> {standard}</p>
             </div>
             
-            <div class="section-card" style="border-left: 5px solid #2563eb; background: #eff6ff; padding: 15px; border-radius: 8px;">
-                <h3 style="color: #2563eb; margin-top: 0;">🛒 Sourcing & Disponibilité</h3>
-                <div style="font-size: 0.95em; line-height: 1.5;">{liens_clean}</div>
+            <div style="border-left:5px solid #2563eb; background:#eff6ff; padding:15px; border-radius:8px;">
+                <h3 style="color:#2563eb; margin-top:0;">🛒 Disponibilité Web</h3>
+                <div style="font-size:0.9em; line-height:1.4;">{liens.replace('$', '&#36;')}</div>
             </div>
         </div>
         """
     except Exception as e:
-        return f"<div style='color:red; padding:20px; border:1px solid red;'>Erreur technique : {str(e)}</div>"
+        return f"<div style='color:red; border:1px solid red; padding:10px;'>Erreur Groq : {str(e)}</div>"
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    """Page d'accueil de la PWA PartFinder."""
+    """Interface utilisateur de PartFinder AI."""
     return """
     <!DOCTYPE html>
     <html lang="fr">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>PartFinder AI</title>
         <style>
-            :root { --primary: #ea580c; --secondary: #2563eb; --bg: #f3f4f6; }
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); margin: 0; padding: 15px; }
-            .app-container { max-width: 500px; margin: auto; background: white; padding: 25px; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); border-top: 10px solid var(--primary); }
-            h1 { color: var(--primary); text-align: center; margin-bottom: 5px; font-size: 1.8rem; }
-            p.subtitle { text-align: center; color: #6b7280; font-size: 0.9rem; margin-bottom: 25px; }
-            .upload-zone { border: 2px dashed #d1d5db; border-radius: 12px; padding: 30px; text-align: center; cursor: pointer; transition: 0.3s; }
-            .upload-zone:hover { border-color: var(--primary); background: #fff7ed; }
-            #preview { width: 100%; border-radius: 12px; margin-top: 15px; display: none; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-            textarea { width: 100%; box-sizing: border-box; margin-top: 15px; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; font-family: inherit; height: 70px; }
-            .btn { width: 100%; padding: 16px; border-radius: 10px; border: none; font-weight: bold; font-size: 1rem; cursor: pointer; margin-top: 15px; transition: 0.2s; }
-            .btn-identify { background: var(--primary); color: white; box-shadow: 0 4px 0 #9a3412; }
-            .btn-identify:active { transform: translateY(2px); box-shadow: 0 2px 0 #9a3412; }
-            #loading { display: none; text-align: center; margin: 20px 0; font-weight: bold; color: var(--primary); }
-            #result { margin-top: 25px; }
-            .loader { border: 4px solid #f3f3f3; border-top: 4px solid var(--primary); border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 10px auto; }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            body { font-family: sans-serif; background: #f3f4f6; padding: 15px; margin: 0; }
+            .container { max-width: 500px; margin: auto; background: white; padding: 25px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); border-top: 8px solid #ea580c; }
+            h1 { color: #ea580c; text-align: center; font-size: 1.5rem; }
+            .btn { width: 100%; padding: 15px; border-radius: 8px; border: none; font-weight: bold; cursor: pointer; margin-top: 15px; font-size: 1rem; }
+            .btn-camera { background: #6b7280; color: white; margin-bottom: 10px; }
+            .btn-run { background: #ea580c; color: white; }
+            #preview { width: 100%; border-radius: 8px; margin-top: 15px; display: none; }
+            textarea { width: 100%; margin-top: 15px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+            #loading { display: none; text-align: center; font-weight: bold; color: #ea580c; margin: 20px 0; }
         </style>
     </head>
     <body>
-        <div class="app-container">
+        <div class="container">
             <h1>🔍 PartFinder AI</h1>
-            <p class="subtitle">Le Shazam de la pièce détachée</p>
+            <p style="text-align:center; font-size:0.9rem; color:#666;">Le Shazam des pièces détachées</p>
             
-            <div class="upload-zone" onclick="document.getElementById('fileInput').click()">
-                <span style="font-size: 40px;">📸</span><br>
-                <strong>PHOTOGRAPHIER LA PIÈCE</strong>
-                <p style="font-size: 0.8rem; color: #9ca3af;">Cliquez ici pour utiliser l'appareil photo</p>
-            </div>
+            <button class="btn btn-camera" onclick="document.getElementById('file').click()">📸 PHOTOGRAPHIER LA PIÈCE</button>
+            <input type="file" id="file" accept="image/*" capture="environment" hidden onchange="showPv(this)">
             
-            <input type="file" id="fileInput" accept="image/*" capture="environment" hidden onchange="handleFile(this)">
             <img id="preview">
             
-            <textarea id="contextInput" placeholder="Ex: C'est un raccord sous un évier de cuisine de 1995..."></textarea>
+            <textarea id="ctx" placeholder="Ajoutez un contexte (ex: évier de cuisine, marque...)"></textarea>
             
-            <button id="submitBtn" class="btn btn-identify">IDENTIFIER ET TROUVER</button>
+            <button id="go" class="btn btn-run" onclick="analyze()">IDENTIFIER ET TROUVER</button>
             
-            <div id="loading">
-                <div class="loader"></div>
-                Identification en cours...
-            </div>
-            
-            <div id="result"></div>
+            <div id="loading">Analyse en cours...</div>
+            <div id="result" style="margin-top:20px;"></div>
         </div>
 
         <script>
-            let selectedFile;
-
-            function handleFile(input) {
-                selectedFile = input.files[0];
-                if (selectedFile) {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        const preview = document.getElementById('preview');
-                        preview.src = e.target.result;
-                        preview.style.display = 'block';
-                    };
-                    reader.readAsDataURL(selectedFile);
-                }
+            let img;
+            function showPv(i) {
+                img = i.files[0];
+                const r = new FileReader();
+                r.onload = (e) => {
+                    const p = document.getElementById('preview');
+                    p.src = e.target.result;
+                    p.style.display = 'block';
+                };
+                r.readAsDataURL(img);
             }
 
-            document.getElementById('submitBtn').addEventListener('click', async () => {
-                if (!selectedFile) {
-                    alert("Veuillez d'abord prendre une photo.");
-                    return;
-                }
+            async function analyze() {
+                if(!img) return alert("Prenez une photo d'abord");
+                const res = document.getElementById('result');
+                const load = document.getElementById('loading');
+                res.innerHTML = "";
+                load.style.display = "block";
 
-                const resultDiv = document.getElementById('result');
-                const loadingDiv = document.getElementById('loading');
-                const btn = document.getElementById('submitBtn');
-
-                resultDiv.innerHTML = "";
-                loadingDiv.style.display = "block";
-                btn.disabled = true;
-                btn.style.opacity = "0.5";
-
-                const formData = new FormData();
-                formData.append('image', selectedFile);
-                formData.append('context', document.getElementById('contextInput').value);
+                const fd = new FormData();
+                fd.append('image', img);
+                fd.append('context', document.getElementById('ctx').value);
 
                 try {
-                    const response = await fetch('/identify', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    if (response.ok) {
-                        resultDiv.innerHTML = await response.text();
-                    } else {
-                        resultDiv.innerHTML = "<p style='color:red;'>Erreur serveur lors de l'analyse.</p>";
-                    }
-                } catch (err) {
-                    resultDiv.innerHTML = "<p style='color:red;'>Erreur réseau. Vérifiez votre connexion.</p>";
+                    const r = await fetch('/identify', { method: 'POST', body: fd });
+                    res.innerHTML = await r.text();
+                } catch (e) {
+                    res.innerHTML = "Erreur de connexion au serveur.";
                 } finally {
-                    loadingDiv.style.display = "none";
-                    btn.disabled = false;
-                    btn.style.opacity = "1";
+                    load.style.display = "none";
                 }
-            });
+            }
         </script>
     </body>
     </html>
