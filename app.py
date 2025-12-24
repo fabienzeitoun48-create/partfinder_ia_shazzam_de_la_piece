@@ -17,19 +17,20 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- RECHERCHE ET NETTOYAGE DES LIENS ---
+# --- RECHERCHE ULTRA-PRÉCISE (FICHES PRODUITS) ---
 async def search_perplexity_async(query: str):
     api_key = os.environ.get("PERPLEXITY_API_KEY")
-    if not api_key: return "⚠️ Clé API absente."
+    if not api_key: return "⚠️ API Key manquante."
     
     url = "https://api.perplexity.ai/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     
+    # On force l'IA à trouver des liens de fiches produits réelles
     data = {
         "model": "sonar", 
         "messages": [
-            {"role": "system", "content": "Trouve 3 sites marchands. Réponds UNIQUEMENT avec une liste Markdown : - [Nom du Site](URL) - Prix. Pas de texte avant ou après."},
-            {"role": "user", "content": f"Acheter : {query}"}
+            {"role": "system", "content": "Tu es un expert en pièces détachées. Ta mission : trouver des liens de fiches produits réelles (Deep Links) pour l'objet exact. Ne donne pas de liens vers des pages d'accueil ou des catégories générales. Donne 3 liens directs : Nom de l'article - Prix - [Cliquer ici](URL)."},
+            {"role": "user", "content": f"Trouve la fiche produit exacte pour : {query} sur des sites comme RS Components, ManoMano, Amazon, ou Leroy Merlin."}
         ],
         "temperature": 0
     }
@@ -37,14 +38,14 @@ async def search_perplexity_async(query: str):
     async with httpx.AsyncClient() as client:
         try:
             res = await client.post(url, json=data, headers=headers, timeout=25.0)
-            if res.status_code != 200: return f"Recherche indisponible ({res.status_code})"
+            if res.status_code != 200: return f"Erreur sourcing : {res.status_code}"
             
             content = res.json()['choices'][0]['message']['content']
-            # Transformation du Markdown [Texte](URL) en HTML cliquable <a href='URL'>Texte</a>
-            html_links = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank" class="buy-link">🔗 \1</a>', content)
+            # Nettoyage et transformation en boutons cliquables
+            html_links = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank" class="buy-link">🔍 Voir le produit</a>', content)
             return html_links.replace("\n", "<br>")
         except:
-            return "Délai dépassé."
+            return "Recherche expirée. Réessayez."
 
 @app.post("/identify", response_class=HTMLResponse)
 async def identify(image: UploadFile = File(...), context: str = Form("")):
@@ -55,13 +56,14 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         img_bytes = await image.read()
         img_b64 = base64.b64encode(img_bytes).decode('utf-8')
         
+        # On demande à Llama Scout d'être extrêmement descriptif pour la recherche web
         prompt = """
-        Analyse technique :
-        Réponds en JSON uniquement :
+        IDENTIFICATION TECHNIQUE POUR ACHAT.
+        Réponds UNIQUEMENT en JSON :
         {
-          "matiere": "Description courte (ex: Laiton poli)",
-          "standard": "Analyse technique (ex: Filetage gaz 1/2)",
-          "recherche": "Nom pour achat"
+          "matiere": "Détails visuels précis (ex: Laiton chromé, traces de calcaire, poignée levier)",
+          "standard": "Dimensions et type exact (ex: Mélangeur évier, entraxe 150mm, filetage 1/2)",
+          "recherche_exacte": "Nom ultra-précis pour recherche Google Shopping (ex: Mitigeur évier bec fondu Grohe BauEdge 31367000)"
         }
         """
         
@@ -73,13 +75,14 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         )
         
         data = json.loads(completion.choices[0].message.content)
-        links = await search_perplexity_async(data.get("recherche"))
+        # On utilise 'recherche_exacte' pour que Perplexity ne cherche pas n'importe quoi
+        links = await search_perplexity_async(data.get("recherche_exacte"))
         
         return f"""
-        <div class="results">
-            <div class="res-card mat"><strong>🧪 Matériau</strong><p>{data.get('matiere')}</p></div>
-            <div class="res-card std"><strong>📐 Technique</strong><p>{data.get('standard')}</p></div>
-            <div class="res-card shop"><strong>🛒 Liens d'achat</strong><div class="links-list">{links}</div></div>
+        <div class="results animate-in">
+            <div class="res-card mat"><strong>🧪 Diagnostic Matériau</strong><p>{data.get('matiere')}</p></div>
+            <div class="res-card std"><strong>📏 Caractéristiques</strong><p>{data.get('standard')}</p></div>
+            <div class="res-card shop"><strong>🛒 Fiches Produits Trouvées</strong><div class="links-list">{links}</div></div>
             <button class="btn btn-run" onclick="location.reload()">🔄 Nouveau Scan</button>
         </div>
         """
@@ -96,49 +99,60 @@ def home():
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
         <title>PartFinder PRO</title>
         <style>
-            body { font-family: -apple-system, sans-serif; background: #f4f4f9; padding: 15px; margin: 0; color: #333; }
-            .container { max-width: 480px; margin: auto; background: white; border-radius: 20px; padding: 20px; box-shadow: 0 8px 20px rgba(0,0,0,0.1); }
-            h1 { color: #ea580c; text-align: center; margin-bottom: 20px; }
-            .btn { width: 100%; padding: 18px; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; font-size: 1rem; margin-bottom: 10px; transition: 0.2s; }
-            .btn-cam { background: #ea580c; color: white; }
-            .btn-run { background: #1e293b; color: white; }
-            #preview { width: 100%; border-radius: 15px; margin-bottom: 15px; display: none; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+            :root { --p: #ea580c; --b: #1e293b; }
+            body { font-family: -apple-system, sans-serif; background: #f8fafc; padding: 15px; margin: 0; }
+            .container { max-width: 480px; margin: auto; background: white; border-radius: 24px; padding: 25px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+            h1 { color: var(--p); text-align: center; margin-bottom: 5px; font-size: 1.6rem; }
+            p.info { text-align: center; color: #64748b; font-size: 0.85rem; margin-bottom: 25px; }
+            .btn { width: 100%; padding: 18px; border-radius: 14px; border: none; font-weight: bold; cursor: pointer; font-size: 1rem; margin-bottom: 12px; transition: 0.2s; }
+            .btn-cam { background: var(--p); color: white; box-shadow: 0 4px 15px rgba(234, 88, 12, 0.2); }
+            .btn-run { background: var(--b); color: white; }
+            #preview { width: 100%; border-radius: 16px; margin-bottom: 15px; display: none; }
             
             .input-area { position: relative; margin-bottom: 15px; }
-            textarea { width: 100%; padding: 15px; border: 1px solid #ddd; border-radius: 12px; box-sizing: border-box; font-family: inherit; resize: none; font-size: 1rem; }
-            .mic-btn { position: absolute; right: 10px; top: 12px; font-size: 1.5rem; cursor: pointer; background: none; border: none; }
+            textarea { width: 100%; padding: 15px; border: 1.5px solid #e2e8f0; border-radius: 14px; box-sizing: border-box; font-family: inherit; resize: none; min-height: 80px; }
+            .mic-btn { position: absolute; right: 12px; top: 12px; font-size: 1.6rem; background: none; border: none; cursor: pointer; }
             
-            .res-card { padding: 15px; border-radius: 12px; margin-top: 12px; background: #fff; border: 1px solid #eee; }
-            .mat { border-left: 5px solid #ea580c; }
+            .res-card { padding: 18px; border-radius: 14px; margin-top: 15px; background: #fff; border: 1px solid #e2e8f0; }
+            .mat { border-left: 5px solid var(--p); }
             .std { border-left: 5px solid #10b981; }
-            .shop { border-left: 5px solid #3b82f6; background: #f0f7ff; }
+            .shop { border-left: 5px solid #3b82f6; background: #f0f9ff; }
             
-            /* Style des liens cliquables */
-            .buy-link { display: inline-block; background: white; border: 1px solid #3b82f6; color: #3b82f6; padding: 8px 12px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 5px 0; font-size: 0.9rem; }
-            .buy-link:hover { background: #3b82f6; color: white; }
+            .buy-link { display: block; background: white; border: 1.5px solid #3b82f6; color: #3b82f6; padding: 12px; border-radius: 10px; text-decoration: none; font-weight: bold; margin: 10px 0; text-align: center; font-size: 0.95rem; }
+            .buy-link:active { background: #3b82f6; color: white; }
             
-            #loader { display: none; text-align: center; color: #ea580c; font-weight: bold; padding: 20px; }
+            #loader { display: none; text-align: center; color: var(--p); font-weight: bold; padding: 30px; }
+            .animate-in { animation: fadeIn 0.4s ease-out; }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>PartFinder PRO</h1>
-            <button class="btn btn-cam" onclick="document.getElementById('f').click()">📸 Photo de la pièce</button>
+            <p class="info">Identification technique & Deep-sourcing</p>
+            
+            <button class="btn btn-cam" onclick="document.getElementById('f').click()">📸 Scanner la pièce</button>
             <input type="file" id="f" accept="image/*" capture="environment" hidden onchange="pv(this)">
             <img id="preview">
             
             <div class="input-area">
-                <textarea id="ctx" placeholder="Où est située la pièce ?"></textarea>
+                <textarea id="ctx" placeholder="Décrivez l'emplacement ou la panne..."></textarea>
                 <button class="mic-btn" onclick="dictate()">🎙️</button>
             </div>
             
             <button id="go" class="btn btn-run" onclick="run()">Lancer l'Analyse</button>
-            <div id="loader">⚙️ Analyse technique en cours...</div>
+            <div id="loader">⚙️ Recherche de références exactes...</div>
             <div id="res"></div>
         </div>
 
         <script>
             let img;
+            // Sauvegarde locale pour éviter de tout perdre au refresh
+            window.onload = () => {
+                const saved = localStorage.getItem('last_res');
+                if(saved) document.getElementById('res').innerHTML = saved;
+            };
+
             function pv(i) {
                 img = i.files[0];
                 const r = new FileReader();
@@ -157,17 +171,22 @@ def home():
             }
 
             async function run() {
-                if(!img) return alert("Prends une photo d'abord");
+                if(!img) return alert("Photo requise");
                 document.getElementById('loader').style.display="block";
+                document.getElementById('res').innerHTML = "";
                 document.getElementById('go').style.display="none";
+                
                 const fd = new FormData();
                 fd.append('image', img);
                 fd.append('context', document.getElementById('ctx').value);
+                
                 try {
                     const r = await fetch('/identify', { method: 'POST', body: fd });
-                    document.getElementById('res').innerHTML = await r.text();
+                    const html = await r.text();
+                    document.getElementById('res').innerHTML = html;
+                    localStorage.setItem('last_res', html); // Sauvegarde
                 } catch (e) {
-                    alert("Erreur");
+                    alert("Erreur de connexion");
                 } finally {
                     document.getElementById('loader').style.display="none";
                 }
