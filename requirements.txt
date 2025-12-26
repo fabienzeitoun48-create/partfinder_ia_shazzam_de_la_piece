@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 groq
-mistralai
+mistralai>=1.0.0
 python-dotenv
 httpx
 python-multipart
+
 
