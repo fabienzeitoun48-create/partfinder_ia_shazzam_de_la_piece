@@ -18,44 +18,52 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 mistral_client = Mistral(api_key=os.environ.get("MISTRAL_API_KEY"))
 
-# --- LOGIQUE DE SOURCING ---
+# --- AGENT DE RAISONNEMENT : DEEPSEEK (Fix Error 400 JSON) ---
 async def deepseek_consensus(llama_txt, mistral_txt, user_ctx):
-    """DeepSeek agit en ingénieur méthode : il valide les matériaux et crée la requête d'achat."""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     url = "https://api.deepseek.com/v1/chat/completions"
     
-    # On injecte ton contexte utilisateur comme "Contrainte Critique"
+    # Le mot "JSON" est maintenant explicitement présent pour éviter l'erreur 400
     prompt = f"""
-    CONTRAINTE UTILISATEUR : {user_ctx}
-    RAPPORT VISION 1 : {llama_txt}
-    RAPPORT VISION 2 : {mistral_txt}
+    CONTEXTE UTILISATEUR : {user_ctx}
+    RAPPORT 1 : {llama_txt}
+    RAPPORT 2 : {mistral_txt}
     
-    Mission : Générer un terme de recherche pour trouver la fiche produit EXACTE. 
-    Si l'utilisateur dit INOX, le terme DOIT contenir 'Acier Inoxydable' ou 'Inox'.
-    Format JSON STRICT : 
-    {{"matiere": "verdict final", "technique": "dimensions/normes", "search": "terme shopping precis"}}
+    Tu es un expert technique. Génère un terme de recherche ultra-précis pour trouver cet objet exact.
+    Si le contexte mentionne INOX, le terme doit inclure 'Acier Inox'.
+    
+    Réponds obligatoirement sous la forme d'un objet JSON :
+    {{
+      "matiere": "verdict sur le matériau",
+      "technique": "dimensions ou normes détectées",
+      "search": "requête précise pour Google Shopping"
+    }}
     """
     
     async with httpx.AsyncClient() as client:
         try:
             res = await client.post(url, 
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}},
-                timeout=12.0)
+                json={
+                    "model": "deepseek-chat", 
+                    "messages": [{"role": "user", "content": prompt}], 
+                    "response_format": {"type": "json_object"} # Exige le mot "JSON" dans le prompt
+                },
+                timeout=15.0)
             return json.loads(res.json()['choices'][0]['message']['content'])
-        except:
-            return {"matiere": "Erreur analyse", "technique": "Inconnue", "search": user_ctx}
+        except Exception as e:
+            return {"matiere": "Analyse standard", "technique": "N/A", "search": user_ctx or "pièce détachée"}
 
+# --- SOURCING : PERPLEXITY ---
 async def search_perplexity_pro(query: str):
     api_key = os.environ.get("PERPLEXITY_API_KEY")
     url = "https://api.perplexity.ai/chat/completions"
     
-    # On force la recherche sur des sites de fournitures industrielles
     data = {
         "model": "sonar",
         "messages": [
-            {"role": "system", "content": "Tu es un acheteur industriel. Trouve 3 URLs de fiches produits (RS, ManoMano, Leroy Merlin, Cedeo). Pas de pages d'accueil. Format: [Nom Produit](URL) - Prix."},
-            {"role": "user", "content": f"Acheter immédiatement : {query}"}
+            {"role": "system", "content": "Trouve 3 liens directs de fiches produits (pas de catégories). Inclus le nom exact et le prix. Format : [Nom](URL)."},
+            {"role": "user", "content": f"Fiche produit exacte pour : {query}"}
         ]
     }
     
@@ -63,11 +71,10 @@ async def search_perplexity_pro(query: str):
         try:
             res = await client.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=data, timeout=25.0)
             content = res.json()['choices'][0]['message']['content']
-            # Nettoyage et transformation des liens en boutons cliquables
             html = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank" class="buy-link">🛒 \1</a>', content)
             return html.replace("\n", "<br>")
         except:
-            return "Aucun lien direct trouvé."
+            return "Aucun lien trouvé."
 
 @app.post("/identify", response_class=HTMLResponse)
 async def identify(image: UploadFile = File(...), context: str = Form("")):
@@ -75,10 +82,10 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         img_bytes = await image.read()
         img_b64 = base64.b64encode(img_bytes).decode('utf-8')
 
-        # Analyse Vision Parallèle
+        # Vision Llama (Correction JSON ici aussi)
         l_task = asyncio.to_thread(groq_client.chat.completions.create,
             model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[{"role": "user", "content": [{"type": "text", "text": "Identifie : matière, type, filetage."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}],
+            messages=[{"role": "user", "content": [{"type": "text", "text": "Identifie l'objet en format JSON : mat, std, search."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}],
             response_format={"type": "json_object"}
         )
 
@@ -88,18 +95,15 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         )
 
         l_res = await l_task
-        # Consensus par DeepSeek (Le cerveau logique)
         final_data = await deepseek_consensus(l_res.choices[0].message.content, m_res.choices[0].message.content, context)
-        
-        # Recherche finale basée sur le consensus
         links_html = await search_perplexity_pro(final_data['search'])
 
         return f"""
         <div class="results animate-in">
-            <div class="res-card mat"><strong>🧪 Matériau validé</strong><p>{final_data['matiere']}</p></div>
+            <div class="res-card mat"><strong>🧪 Matériau</strong><p>{final_data['matiere']}</p></div>
             <div class="res-card std"><strong>📐 Fiche technique</strong><p>{final_data['technique']}</p></div>
-            <div class="res-card shop"><strong>🔗 Liens d'achat directs</strong>
-                <p style="font-size:0.75rem; color:#666">Cible : {final_data['search']}</p>
+            <div class="res-card shop"><strong>🔗 Liens directs</strong>
+                <p style="font-size:0.7rem; color:#666">Cible : {final_data['search']}</p>
                 <div class="links-list">{links_html}</div>
             </div>
             <button class="btn btn-run" onclick="location.reload()">🔄 Nouveau Scan</button>
@@ -116,46 +120,62 @@ def home():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>PartFinder Ultra</title>
+        <title>PartFinder Pro</title>
         <style>
-            body { font-family: sans-serif; background: #f0f4f8; padding: 20px; }
-            .container { max-width: 450px; margin: auto; background: white; border-radius: 20px; padding: 25px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); }
-            h1 { color: #ea580c; text-align: center; }
-            .btn { width: 100%; padding: 18px; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; margin-top: 10px; }
-            .btn-cam { background: #ea580c; color: white; }
-            .btn-run { background: #1e293b; color: white; }
-            textarea { width: 100%; padding: 12px; border: 1px solid #ccc; border-radius: 10px; margin: 15px 0; box-sizing: border-box; }
-            #preview { width: 100%; border-radius: 10px; display: none; margin-bottom: 10px; }
-            .res-card { padding: 15px; border-radius: 10px; margin-top: 15px; border: 1px solid #ddd; background: #fff; }
+            body { font-family: sans-serif; background: #f0f4f8; padding: 15px; margin: 0; }
+            .container { max-width: 450px; margin: auto; background: white; border-radius: 20px; padding: 20px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
+            .btn { width: 100%; padding: 16px; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; font-size: 1rem; }
+            .btn-cam { background: #ea580c; color: white; margin-bottom: 10px; }
+            .btn-run { background: #1e293b; color: white; margin-top: 10px; }
+            #preview { width: 100%; border-radius: 12px; display: none; margin-top: 10px; }
+            .input-box { position: relative; margin-top: 15px; }
+            textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 10px; box-sizing: border-box; min-height: 80px; }
+            .mic-btn { position: absolute; right: 10px; top: 10px; font-size: 1.5rem; background: none; border: none; cursor: pointer; }
+            .res-card { padding: 15px; border-radius: 10px; margin-top: 15px; border: 1px solid #eee; }
             .mat { border-left: 5px solid #ea580c; }
             .std { border-left: 5px solid #10b981; }
             .shop { border-left: 5px solid #3b82f6; background: #f0f7ff; }
             .buy-link { display: block; background: white; border: 1px solid #3b82f6; color: #3b82f6; padding: 10px; border-radius: 8px; text-decoration: none; margin: 8px 0; text-align: center; font-weight: bold; }
-            #loader { display: none; text-align: center; font-weight: bold; color: #ea580c; padding: 20px; }
+            #loader { display: none; text-align: center; padding: 20px; color: #ea580c; font-weight: bold; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>PartFinder Ultra</h1>
-            <button class="btn btn-cam" onclick="document.getElementById('f').click()">📸 Scanner la pièce</button>
+            <h2 style="text-align:center; color:#ea580c;">PartFinder Pro</h2>
+            <button class="btn btn-cam" onclick="document.getElementById('f').click()">📸 Photo de la pièce</button>
             <input type="file" id="f" accept="image/*" capture="environment" hidden onchange="pv(this)">
             <img id="preview">
-            <textarea id="ctx" placeholder="Précisez le matériau ou l'usage (ex: Inox, 15/21...)"></textarea>
-            <button id="go" class="btn btn-run" onclick="run()">LANCER L'IDENTIFICATION</button>
-            <div id="loader">⚙️ Analyse multicouche...</div>
+            
+            <div class="input-box">
+                <textarea id="ctx" placeholder="Précisez le matériau (Inox, Laiton...)"></textarea>
+                <button class="mic-btn" onclick="dictate()">🎙️</button>
+            </div>
+            
+            <button id="go" class="btn btn-run" onclick="run()">Lancer l'Analyse</button>
+            <div id="loader">⚙️ Triple Analyse + Sourcing...</div>
             <div id="res"></div>
         </div>
         <script>
             let img;
             function pv(i) { img = i.files[0]; const r = new FileReader(); r.onload=(e)=>{ const p=document.getElementById('preview'); p.src=e.target.result; p.style.display='block'; }; r.readAsDataURL(img); }
+            
+            function dictate() {
+                const sr = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+                sr.lang = 'fr-FR';
+                sr.onresult = (e) => { document.getElementById('ctx').value = e.results[0][0].transcript; };
+                sr.start();
+            }
+
             async function run() {
                 if(!img) return alert("Photo manquante");
                 document.getElementById('loader').style.display="block";
                 document.getElementById('go').style.display="none";
                 const fd = new FormData(); fd.append('image', img); fd.append('context', document.getElementById('ctx').value);
-                const r = await fetch('/identify', { method: 'POST', body: fd });
-                document.getElementById('res').innerHTML = await r.text();
-                document.getElementById('loader').style.display="none";
+                try {
+                    const r = await fetch('/identify', { method: 'POST', body: fd });
+                    document.getElementById('res').innerHTML = await r.text();
+                } catch (e) { alert("Erreur réseau"); } 
+                finally { document.getElementById('loader').style.display="none"; }
             }
         </script>
     </body>
