@@ -6,4 +6,6 @@ python-dotenv
 httpx
 python-multipart
 Pillow>=9.5.0
+sentence-transformers>=2.2.2
+torch>=2.0.0
 opencv-python-headless>=4.8.0
