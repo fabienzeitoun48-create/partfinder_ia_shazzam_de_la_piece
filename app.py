@@ -5,6 +5,7 @@ import asyncio
 import json
 import re
 import time
+import io
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
 from fastapi import FastAPI, UploadFile, Form, File
@@ -15,6 +16,9 @@ from dotenv import load_dotenv
 from PIL import Image, ImageStat
 import numpy as np
 from functools import wraps
+
+# Optional: sentence-transformers for CLIP embeddings
+from sentence_transformers import SentenceTransformer, util as st_util
 
 load_dotenv()
 app = FastAPI()
@@ -45,6 +49,13 @@ BLACKLIST_PATTERNS = ['/category', '/cat/', '/search', '/recherche', '/famille',
 # Simple in-memory TTL cache for URL validation to reduce load
 _URL_VALIDATION_CACHE: Dict[str, Dict[str, Any]] = {}
 _URL_CACHE_TTL = 60 * 60 * 24  # 24h
+
+# CLIP model (sentence-transformers)
+CLIP_MODEL_NAME = os.environ.get("CLIP_MODEL_NAME", "clip-ViT-B-32")
+try:
+    _clip_model = SentenceTransformer(CLIP_MODEL_NAME)
+except Exception:
+    _clip_model = None  # degrade gracefully if not installed
 
 # -------------------------
 # Utilities
@@ -79,7 +90,6 @@ def is_valid_product_link(url: str) -> bool:
     lower = url.lower()
     if any(p in lower for p in BLACKLIST_PATTERNS):
         return False
-    # basic scheme check
     if not lower.startswith("http"):
         return False
     return True
@@ -101,15 +111,11 @@ def looks_like_product_page_text(html_text: str) -> bool:
 # -------------------------
 # Image quality checks
 # -------------------------
-def pil_image_from_bytes(b: bytes) -> Image.Image:
-    return Image.open(io_bytes := (lambda x: Image.open(io := __import__("io").BytesIO(x)))(b))
-
 def image_brightness(img: Image.Image) -> float:
     stat = ImageStat.Stat(img.convert("L"))
     return stat.mean[0]
 
 def variance_of_laplacian_numpy(img: Image.Image) -> float:
-    # Fallback if OpenCV not available: approximate Laplacian variance using numpy gradients
     gray = np.asarray(img.convert("L"), dtype=np.float32)
     gy, gx = np.gradient(gray)
     grad_mag = np.sqrt(gx * gx + gy * gy)
@@ -117,16 +123,13 @@ def variance_of_laplacian_numpy(img: Image.Image) -> float:
 
 def image_blur_score(img_bytes: bytes) -> float:
     """
-    Returns a blur score: higher = sharper. Uses OpenCV if available, else numpy fallback.
-    Thresholds:
-      - > 100 : sharp
-      - 30-100 : acceptable
-      - < 30 : blurry
+    Returns a blur score: higher = sharper.
+    Fallback uses numpy gradients if OpenCV not available.
     """
     try:
-        import cv2
-        import numpy as np
-        arr = np.frombuffer(img_bytes, np.uint8)
+        import cv2  # type: ignore
+        import numpy as _np  # type: ignore
+        arr = _np.frombuffer(img_bytes, _np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return 0.0
@@ -134,16 +137,15 @@ def image_blur_score(img_bytes: bytes) -> float:
         var = float(lap.var())
         return var
     except Exception:
-        # fallback
         try:
-            img = Image.open(__import__("io").BytesIO(img_bytes))
+            img = Image.open(io.BytesIO(img_bytes))
             return variance_of_laplacian_numpy(img)
         except Exception:
             return 0.0
 
 def image_too_small(img_bytes: bytes, min_pixels: int = 224*224) -> bool:
     try:
-        img = Image.open(__import__("io").BytesIO(img_bytes))
+        img = Image.open(io.BytesIO(img_bytes))
         w, h = img.size
         return (w * h) < min_pixels
     except Exception:
@@ -152,7 +154,7 @@ def image_too_small(img_bytes: bytes, min_pixels: int = 224*224) -> bool:
 def image_quality_check(img_bytes: bytes) -> Dict[str, Any]:
     """
     Returns dict with keys:
-      - ok: bool (True if image is acceptable)
+      - ok: bool
       - reasons: list[str]
       - blur_score: float
       - brightness: float
@@ -161,14 +163,13 @@ def image_quality_check(img_bytes: bytes) -> Dict[str, Any]:
     reasons = []
     blur = image_blur_score(img_bytes)
     size_ok = not image_too_small(img_bytes)
-    brightness = None
+    brightness = 0.0
     try:
-        img = Image.open(__import__("io").BytesIO(img_bytes))
+        img = Image.open(io.BytesIO(img_bytes))
         brightness = image_brightness(img)
     except Exception:
         brightness = 0.0
 
-    # thresholds tuned for production conservative behavior
     if blur < 30:
         reasons.append("image_blurry")
     if not size_ok:
@@ -185,48 +186,17 @@ def image_quality_check(img_bytes: bytes) -> Dict[str, Any]:
     }
 
 # -------------------------
-# URL validation (production)
+# Network helpers
 # -------------------------
 async def _fetch_text(client: httpx.AsyncClient, url: str, timeout: float = 6.0) -> Optional[str]:
     try:
         r = await client.get(url, timeout=timeout, follow_redirects=True)
-        # only consider HTML responses
         ctype = r.headers.get("content-type", "")
         if "text/html" in ctype or "application/xhtml+xml" in ctype:
             return r.text[:200000]
         return ""
     except Exception:
         return None
-
-@ttl_cache(_URL_CACHE_TTL)
-async def validate_product_url(url: str, timeout: float = 6.0) -> Dict[str, Any]:
-    """
-    Production-grade validation:
-      - rejects blacklisted patterns
-      - fetches page (short timeout)
-      - checks heuristics (price, sku, product microdata)
-      - returns structured result with score and reason
-    """
-    if not is_valid_product_link(url):
-        return {"url": url, "ok": False, "score": 0, "reason": "invalid_format_or_blacklisted"}
-
-    domain = domain_from_url(url)
-    base_score = 35 if domain in WHITELIST_DOMAINS else 10
-
-    async with httpx.AsyncClient() as client:
-        text = await _fetch_text(client, url, timeout=timeout)
-        if text is None:
-            return {"url": url, "ok": False, "score": 0, "reason": "fetch_error"}
-        score = base_score
-        if looks_like_product_page_text(text):
-            score += 50
-        if re.search(r'(\d[\d\s,.]{1,6})\s?(€|eur|€)', text, flags=re.IGNORECASE):
-            score += 10
-        if re.search(r'\b(réf|référence|sku|part ?no|partnumber)\b', text, flags=re.IGNORECASE):
-            score += 10
-        ok = score >= 50
-        reason = "ok" if ok else "low_score"
-        return {"url": url, "ok": ok, "score": score, "reason": reason, "domain": domain}
 
 # -------------------------
 # Perplexity / Sonar call (production)
@@ -244,7 +214,7 @@ async def call_perplexity_api(query: str, max_candidates: int = 8) -> Any:
       <constraint>Vérifier dimensions exactes (filetage, diamètre)</constraint>
       <constraint>Retourner uniquement URLs de produits précis</constraint>
     </constraints>
-    <output_format>JSON array: [{"nom":"", "prix":"", "url":"", "source":""}]</output_format>
+    <output_format>JSON array: [{"nom":"", "prix":"", "url":"", "image_url":"", "source":""}]</output_format>
     </system_instructions>
     """
 
@@ -252,7 +222,7 @@ async def call_perplexity_api(query: str, max_candidates: int = 8) -> Any:
         "model": "sonar",
         "messages": [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": f"Trouve produits pour : {query} Donne max {max_candidates} résultats, format JSON."}
+            {"role": "user", "content": f"Trouve produits pour : {query} Donne max {max_candidates} résultats, format JSON. Inclure image_url si possible et un champ confidence."}
         ],
         "temperature": 0.1
     }
@@ -269,18 +239,15 @@ async def call_perplexity_api(query: str, max_candidates: int = 8) -> Any:
                 await asyncio.sleep(PERPLEXITY_BACKOFF ** attempt)
                 continue
             payload = res.json()
-            # Expecting the model to return JSON in choices[0].message.content
             raw = payload.get("choices", [{}])[0].get("message", {}).get("content")
             if not raw:
                 return {"error": "empty_response"}
             parsed = json.loads(raw)
-            # parsed may be {"produits": [...] } or a list
             if isinstance(parsed, dict) and "produits" in parsed:
                 candidates = parsed["produits"]
             elif isinstance(parsed, list):
                 candidates = parsed
             else:
-                # try to be tolerant
                 candidates = parsed if isinstance(parsed, list) else []
             return {"candidates": candidates}
         except Exception as e:
@@ -291,16 +258,128 @@ async def call_perplexity_api(query: str, max_candidates: int = 8) -> Any:
     return {"error": "perplexity_failed"}
 
 # -------------------------
+# Image / visual helpers (CLIP)
+# -------------------------
+def extract_product_image_url(html_text: str) -> str:
+    if not html_text:
+        return ""
+    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r'<meta[^>]+name=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r'<meta[^>]+itemprop=["\']image["\'][^>]+content=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r'<img[^>]+class=["\'][^"\']*(product|produit)[^"\']*["\'][^>]+src=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if m:
+        return m.group(2)
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return ""
+
+async def fetch_image_bytes(url: str, timeout: float = 6.0) -> Optional[bytes]:
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=timeout, follow_redirects=True)
+            ctype = r.headers.get("content-type", "")
+            if r.status_code == 200 and ("image/" in ctype or url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
+                return r.content
+    except Exception:
+        return None
+    return None
+
+def image_embedding_from_bytes(img_bytes: bytes):
+    if _clip_model is None:
+        return None
+    try:
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        emb = _clip_model.encode(pil_img, convert_to_tensor=True, normalize_embeddings=True)
+        return emb
+    except Exception:
+        return None
+
+def cosine_similarity_score(a, b) -> float:
+    try:
+        return float(st_util.cos_sim(a, b).item())
+    except Exception:
+        return 0.0
+
+# -------------------------
+# URL validation (production) with visual similarity
+# -------------------------
+@ttl_cache(_URL_CACHE_TTL)
+async def validate_product_url(url: str, photo_emb=None, timeout: float = 6.0) -> Dict[str, Any]:
+    if not is_valid_product_link(url):
+        return {"url": url, "ok": False, "score": 0, "reason": "invalid_format_or_blacklisted"}
+
+    domain = domain_from_url(url)
+    base_html_score = 35 if domain in WHITELIST_DOMAINS else 10
+
+    async with httpx.AsyncClient() as client:
+        text = await _fetch_text(client, url, timeout=timeout)
+        if text is None:
+            return {"url": url, "ok": False, "score": 0, "reason": "fetch_error"}
+
+        html_score = base_html_score
+        if looks_like_product_page_text(text):
+            html_score += 50
+        if re.search(r'(\d[\d\s,.]{1,6})\s?(€|eur|€)', text, flags=re.IGNORECASE):
+            html_score += 10
+        if re.search(r'\b(réf|référence|sku|part ?no|partnumber)\b', text, flags=re.IGNORECASE):
+            html_score += 10
+
+        prod_img_url = extract_product_image_url(text)
+        visual_similarity = None
+        visual_score = 0
+        if prod_img_url:
+            img_bytes = await fetch_image_bytes(prod_img_url, timeout=timeout)
+            if img_bytes:
+                prod_emb = image_embedding_from_bytes(img_bytes)
+                if prod_emb is not None and photo_emb is not None:
+                    sim = cosine_similarity_score(photo_emb, prod_emb)
+                    visual_similarity = sim
+                    if sim >= 0.45:
+                        visual_score = 50
+                    elif sim >= 0.30:
+                        visual_score = int(25 + (sim - 0.30) / 0.15 * 25)
+                    elif sim >= 0.20:
+                        visual_score = 10
+                    else:
+                        visual_score = 0
+                else:
+                    visual_similarity = None
+                    visual_score = 0
+            else:
+                visual_similarity = None
+                visual_score = 0
+        else:
+            visual_similarity = None
+            visual_score = 0
+
+        total_score = html_score + visual_score
+        ok = (total_score >= 70) and (visual_score >= 10)
+        reason = "ok" if ok else ("low_similarity" if visual_score < 10 else "low_score")
+
+        return {
+            "url": url,
+            "ok": ok,
+            "score": total_score,
+            "reason": reason,
+            "visual_similarity": visual_similarity,
+            "visual_score": visual_score,
+            "html_score": html_score,
+            "domain": domain,
+            "product_image": prod_img_url
+        }
+
+# -------------------------
 # High-level pipeline
 # -------------------------
-async def search_perplexity_async(query: str, max_candidates: int = 8) -> List[Dict[str, Any]]:
-    """
-    Production-ready wrapper:
-      - calls Perplexity/Sonar
-      - validates candidate URLs in parallel
-      - returns filtered, scored list (may return empty list)
-    """
-    if not query or not isinstance(query, str) or query.strip() == "":
+async def search_perplexity_async(photo_bytes: bytes, query: str, max_candidates: int = 8) -> List[Dict[str, Any]]:
+    if not query:
         return []
 
     resp = await call_perplexity_api(query, max_candidates=max_candidates)
@@ -308,7 +387,6 @@ async def search_perplexity_async(query: str, max_candidates: int = 8) -> List[D
         return [{"error": resp["error"]}]
 
     candidates = resp.get("candidates", [])[:max_candidates]
-    # ensure structure
     normalized = []
     for c in candidates:
         if isinstance(c, dict) and c.get("url"):
@@ -316,16 +394,20 @@ async def search_perplexity_async(query: str, max_candidates: int = 8) -> List[D
                 "nom": c.get("nom") or "",
                 "prix": c.get("prix") or "",
                 "url": c.get("url"),
-                "source": c.get("source") or domain_from_url(c.get("url", ""))
+                "source": c.get("source") or domain_from_url(c.get("url", "")),
+                "raw": c
             })
 
-    # validate in parallel with concurrency limit
-    results = []
-    sem = asyncio.Semaphore(8)
+    photo_emb = None
+    try:
+        photo_emb = image_embedding_from_bytes(photo_bytes)
+    except Exception:
+        photo_emb = None
 
+    sem = asyncio.Semaphore(8)
     async def _validate_item(item):
         async with sem:
-            v = await validate_product_url(item["url"])
+            v = await validate_product_url(item["url"], photo_emb=photo_emb)
             merged = {
                 "nom": item.get("nom"),
                 "prix": item.get("prix"),
@@ -333,19 +415,19 @@ async def search_perplexity_async(query: str, max_candidates: int = 8) -> List[D
                 "source": item.get("source"),
                 "valid": v.get("ok", False),
                 "score": v.get("score", 0),
-                "reason": v.get("reason", "")
+                "reason": v.get("reason"),
+                "visual_similarity": v.get("visual_similarity"),
+                "visual_score": v.get("visual_score"),
+                "html_score": v.get("html_score"),
+                "product_image": v.get("product_image"),
+                "raw": item.get("raw")
             }
             return merged
 
     tasks = [_validate_item(it) for it in normalized]
-    if tasks:
-        validated = await asyncio.gather(*tasks, return_exceptions=False)
-    else:
-        validated = []
+    validated = await asyncio.gather(*tasks, return_exceptions=False) if tasks else []
 
-    # sort by score desc, prefer valid ones
     validated_sorted = sorted(validated, key=lambda x: (1 if x["valid"] else 0, x["score"]), reverse=True)
-    # return only valid first; if none valid, return top candidates (so UX can show them)
     valid = [v for v in validated_sorted if v["valid"]]
     return valid if valid else validated_sorted
 
@@ -362,7 +444,15 @@ def format_links_html(products: List[Dict[str, Any]]) -> str:
         price = p.get("prix") or "Voir prix"
         score = p.get("score", 0)
         domain = p.get("source") or domain_from_url(url)
-        html += f'<a href="{url}" target="_blank" class="buy-link">🛒 {name} - {price} <small style="opacity:.6">[{domain} • {score}]</small></a>'
+        vs = p.get("visual_similarity")
+        reason = p.get("reason", "")
+        extra = f" <small style='opacity:.6'>[{domain} • {score}]</small>"
+        if vs is not None:
+            try:
+                extra = f" <small style='opacity:.6'>[{domain} • {score} • sim:{vs:.2f} • {reason}]</small>"
+            except Exception:
+                extra = f" <small style='opacity:.6'>[{domain} • {score} • {reason}]</small>"
+        html += f'<a href="{url}" target="_blank" class="buy-link">🛒 {name} - {price}{extra}</a>'
     return html
 
 # -------------------------
@@ -377,7 +467,6 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         # 1) Quality checks: blur, size, brightness
         quality = image_quality_check(raw_bytes)
         if not quality["ok"]:
-            # Provide explicit reasons and do not call sourcing if image is poor
             reasons_map = {
                 "image_blurry": "Image floue ou manque de netteté",
                 "image_too_small": "Image trop petite / faible résolution",
@@ -405,17 +494,13 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
             response_format={"type": "json_object"}
         )
 
-        # Parse model output safely
         try:
             data = json.loads(completion.choices[0].message.content)
         except Exception:
-            # If parsing fails, return a clear error
             return f"<div class='res-card' style='color:red'>Erreur: réponse du modèle illisible.</div>"
 
-        # If model indicates low confidence or asks for clearer image, respect it
-        # We expect model to optionally include a 'confidence' or 'note' field; be defensive
         model_note = data.get("note") or ""
-        model_confidence = data.get("confidence")  # optional numeric
+        model_confidence = data.get("confidence")
         if isinstance(model_confidence, (int, float)) and model_confidence < 0.4:
             return f"""
             <div class="results animate-in">
@@ -427,9 +512,7 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
             </div>
             """
 
-        # 3) Build search query from model output
         search_query = data.get("search") or ""
-        # If model didn't provide a search query, try to build one from mat/std
         if not search_query:
             parts = []
             if data.get("mat"):
@@ -440,8 +523,8 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
         if not search_query:
             return f"<div class='res-card' style='color:red'>Erreur: aucun terme de recherche généré par le modèle.</div>"
 
-        # 4) Call Perplexity/Sonar to get candidate product URLs and validate them
-        candidates = await search_perplexity_async(search_query)
+        # 4) Call Perplexity/Sonar to get candidate product URLs and validate them (with visual check)
+        candidates = await search_perplexity_async(raw_bytes, search_query)
 
         # 5) Format links for HTML
         links_html = format_links_html(candidates)
@@ -463,7 +546,6 @@ async def identify(image: UploadFile = File(...), context: str = Form("")):
 # -------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Garde l'interface HTML identique (Micro + Caméra)
     return """
     <!DOCTYPE html>
     <html lang="fr">
